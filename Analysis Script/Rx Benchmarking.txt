@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""
+Rx benchmarking table
+=====================
+Recomputes every column of the Rx benchmarking table directly from AlphaFold 3
+output (model .cif + full_data.json) and writes Rx_benchmarking_table.csv / .md.
+
+Metric definitions
+------------------
+Max contact probability
+    max of AF3's `contact_probs` over all token pairs (i,j) with i in region 1
+    and j in region 2. contact_probs[i][j] is AF3's own predicted probability
+    that tokens i and j are in contact (representative atoms, usually CB,
+    within 8 A). It is a confidence measure, NOT a measured distance.
+
+AF3 contact pairs > 0.3
+    number of residue pairs with contact_probs > 0.3. Threshold is arbitrary
+    but consistent across models; 0.3 is a commonly used "worth looking at" cut.
+
+BSA (A^2)
+    buried surface area = (SASA_1 + SASA_2 - SASA_1+2) / 2, Shrake-Rupley
+    numerical SASA, 1.4 A probe, 256-point Fibonacci sphere, Bondi vdW radii.
+    Heavy atoms only. Divided by 2 so it is the area buried on ONE side.
+
+Geometric contacts < 4.5 A
+    number of residue pairs with at least one heavy-atom-to-heavy-atom
+    distance below 4.5 A. Purely geometric, no confidence weighting.
+
+Min sym. PAE (A)
+    min over the cross-region block of the symmetrised PAE,
+    (PAE[i][j] + PAE[j][i]) / 2. Low = AF3 is confident about the relative
+    placement of the two regions. This is the metric that actually
+    discriminates a real interface from a docked-in artefact.
+
+Rx 397-503 side-chain distance (A)
+    minimum heavy-atom distance between the side chains (backbone N/CA/C/O
+    excluded) of residue 397 and residue 503 of chain A.
+
+LIS / cLIS / iLIS  (Kim et al. 2024; official AFM-LIS definitions)
+    every PAE value in the cross-region block below LIS_CUTOFF (default 12 A)
+    is rescaled to (cutoff - PAE)/cutoff, i.e. 0 A -> 1 and 12 A -> 0.
+      LIS   mean of those rescaled values over the pairs that passed.
+            Pairs above the cutoff are excluded from the mean, not counted as
+            zero. Averaged over the two block directions.
+      cLIS  the same mean, but restricted to pairs that are ALSO in physical
+            contact (Cbeta-Cbeta <= CB_CUTOFF, default 8 A; CA for glycine).
+      iLIS  sqrt(LIS * cLIS) -- the geometric mean.
+    LIA and cLIA are the corresponding pair counts (reported so a high score
+    built from very few pairs is visible).
+
+    WHY THIS CHANGED: earlier versions of this script reported LIS under the
+    name "iLIS". They are not the same quantity. LIS uses PAE alone, so a
+    region AF3 places confidently but which is not actually in contact -- a
+    docked-in artefact -- can score as high as a real interface. cLIS is zero
+    for such a region, and because iLIS is a geometric mean, iLIS is zero too.
+    The contact restriction is what does the discriminating.
+
+ipSAE  (interface predicted Structure Alignment Error, Dunbrack 2025)
+    for every residue i on one side, take the partner residues j with
+    PAE[i][j] < IPSAE_CUTOFF (default 10 A); with n0 = number of such j and
+    d0 = max(1.0, 1.24*(max(n0,27)-15)^(1/3) - 1.8), score residue i as
+    mean_j 1/(1 + (PAE[i][j]/d0)^2). ipSAE is the maximum over all residues on
+    both sides. Returns 0 when no pair passes the cutoff.
+
+Interface pLDDT
+    mean per-atom pLDDT over the residues that form the interface, i.e. those
+    with at least one heavy atom within CONTACT_CUTOFF of the partner region.
+    Reported for both sides combined, and per side.
+
+LIGAND HANDLING
+    Ligands (ADP, ATP) are written by AF3 as HETATM records in their own chain
+    and are tokenised one token per heavy atom. They are excluded from every
+    metric here: geometric calculations use `protein_only=True`, which drops
+    HETATM records, and the PAE / contact_probs blocks are selected by chain id
+    so the ligand chain is never included. `--verbose` prints the chain
+    inventory actually used for each model so this can be checked directly.
+
+NOTE ON THE INTRAMOLECULAR ROWS
+    LIS and ipSAE were designed for interfaces between separate chains. The
+    ARC2-LRR comparison is within one chain, whose two halves are covalently
+    tethered, so the PAE block is uniformly low and LIS saturates. cLIS and
+    cLIA do NOT saturate the same way, because they additionally require
+    physical contact -- worth checking whether they separate the functional
+    states before concluding that AF3 says nothing about autoinhibition.
+    Intramolecular values should still not be compared numerically against the
+    intermolecular ones.
+
+Usage
+-----
+    python3 Rx_benchmarking_table.py            # uses the MODELS dict below
+    python3 Rx_benchmarking_table.py --dir DIR  # override the data directory
+"""
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+DATA_DIR = "."
+
+# label -> (cif file, full_data.json file, phenotype, effector chain or None)
+MODELS = [
+    ("Rx WT",            "RxWT_ADP.cif",
+                         "RxWT_full_data.json",                       "WT resting",        None),
+    ("G13R45",           "G13R45.cif",
+                         "G13R45_full_data.json",                     "auto-active",       None),
+    ("R13G45",           "R13G45.cif",
+                         "R13G45_full_data.json",                     "unresponsive",      None),
+    ("Rx WT + PVX-CP",   "fold_rxwt_and_pvxcp_and_adp_model_0.cif",
+                         "fold_rxwt_and_pvxcp_and_adp_full_data_0.json", "HR",              "B"),
+    ("Rx WT + SRE23",    "fold_rxwt_and_sre23_and_adp_model_0.cif",
+                         "fold_rxwt_and_sre23_and_adp_full_data_0.json", "negative control","B"),
+]
+
+ARC2_IF = (372, 440)     # ARC2 regulatory interface, Rx1 numbering
+LRR_IF = (489, 593)      # N-terminal LRR interface, Rx1 numbering
+POLYMORPHIC = (397, 503)  # T397 / R503 in Rx1
+
+VDW = {"C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80,
+       "F": 1.47, "CL": 1.75, "MG": 1.73}
+BACKBONE = {"N", "CA", "C", "O", "OXT"}
+CONTACT_CUTOFF = 4.5
+CP_THRESHOLD = 0.3
+LIS_CUTOFF = 12.0        # Kim et al. 2024 default (PAE)
+CB_CUTOFF = 8.0          # Kim et al. 2024 default (Cbeta-Cbeta contact)
+IPSAE_CUTOFF = 10.0      # Dunbrack ipsae.py, PAE cutoff 10
+PROBE = 1.4
+SPHERE_POINTS = 256
+
+THREE2ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V",
+}
+
+
+# --------------------------------------------------------------------------
+# parsing
+# --------------------------------------------------------------------------
+
+def load_cif(path):
+    """Minimal AF3 mmCIF reader. Returns {(chain, resnum): {...}}.
+
+    AF3 writes fixed-order _atom_site columns; we index them positionally,
+    which is what every AF3 server output uses.
+    """
+    residues = {}
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            f = line.split()
+            element, atom_name, res_name = f[2], f[3], f[5]
+            xyz = np.array([float(f[10]), float(f[11]), float(f[12])])
+            plddt = float(f[14])
+            resnum, chain = int(f[15]), f[16]
+            rec = residues.setdefault(
+                (chain, resnum),
+                {"name": res_name, "atoms": [], "plddt": [],
+                 "hetatm": line.startswith("HETATM")},
+            )
+            rec["atoms"].append((atom_name, element, xyz))
+            rec["plddt"].append(plddt)
+    return residues
+
+
+def load_json(path):
+    with open(path) as fh:
+        d = json.load(fh)
+    return (np.asarray(d["token_chain_ids"]),
+            np.asarray(d["token_res_ids"]),
+            np.asarray(d["pae"], dtype=float),
+            np.asarray(d["contact_probs"], dtype=float))
+
+
+# --------------------------------------------------------------------------
+# geometry
+# --------------------------------------------------------------------------
+
+def fibonacci_sphere(n=SPHERE_POINTS):
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1 - 2 * i / n)
+    theta = np.pi * (1 + 5 ** 0.5) * i
+    return np.column_stack([np.cos(theta) * np.sin(phi),
+                            np.sin(theta) * np.sin(phi),
+                            np.cos(phi)])
+
+
+_SPHERE = fibonacci_sphere()
+
+
+def sasa(coords, radii, probe=PROBE):
+    """Shrake-Rupley solvent accessible surface area, per atom."""
+    r = radii + probe
+    tree = cKDTree(coords)
+    out = np.zeros(len(coords))
+    rmax = r.max()
+    for i in range(len(coords)):
+        neigh = [j for j in tree.query_ball_point(coords[i], r[i] + rmax)
+                 if j != i]
+        pts = coords[i] + _SPHERE * r[i]
+        acc = np.ones(len(pts), dtype=bool)
+        for j in neigh:
+            acc &= ((pts - coords[j]) ** 2).sum(1) > r[j] ** 2
+        out[i] = 4 * np.pi * r[i] ** 2 * acc.sum() / len(pts)
+    return out
+
+
+def atom_list(residues, chain, lo=None, hi=None, protein_only=True):
+    out = []
+    for (ch, num), rec in residues.items():
+        if ch != chain:
+            continue
+        if protein_only and rec["hetatm"]:
+            continue
+        if lo is not None and not (lo <= num <= hi):
+            continue
+        for atom_name, element, xyz in rec["atoms"]:
+            out.append((num, atom_name, element, xyz))
+    return out
+
+
+def buried_surface_area(group_a, group_b):
+    xa = np.array([a[3] for a in group_a])
+    ra = np.array([VDW.get(a[2].upper(), 1.7) for a in group_a])
+    xb = np.array([b[3] for b in group_b])
+    rb = np.array([VDW.get(b[2].upper(), 1.7) for b in group_b])
+    both_x = np.vstack([xa, xb])
+    both_r = np.concatenate([ra, rb])
+    return (sasa(xa, ra).sum() + sasa(xb, rb).sum() - sasa(both_x, both_r).sum()) / 2
+
+
+def residue_contacts(group_a, group_b, cutoff=CONTACT_CUTOFF):
+    """Residue pairs with any heavy-atom distance below cutoff."""
+    xb = np.array([b[3] for b in group_b])
+    tree = cKDTree(xb)
+    pairs = {}
+    for num_a, _, _, xyz in group_a:
+        for j in tree.query_ball_point(xyz, cutoff):
+            num_b = group_b[j][0]
+            d = float(np.linalg.norm(xyz - xb[j]))
+            key = (num_a, num_b)
+            if key not in pairs or d < pairs[key]:
+                pairs[key] = d
+    return pairs
+
+
+def sidechain_min_distance(residues, chain, res1, res2):
+    def sc(num):
+        rec = residues.get((chain, num))
+        if rec is None:
+            return None
+        atoms = [xyz for name, _, xyz in rec["atoms"] if name not in BACKBONE]
+        if not atoms:                       # glycine: fall back to CA
+            atoms = [xyz for name, _, xyz in rec["atoms"] if name == "CA"]
+        return atoms
+    a, b = sc(res1), sc(res2)
+    if not a or not b:
+        return None
+    return float(min(np.linalg.norm(x - y) for x in a for y in b))
+
+
+# --------------------------------------------------------------------------
+# AF3 confidence
+# --------------------------------------------------------------------------
+
+def token_index(chain_ids, res_ids, chain, lo=None, hi=None):
+    mask = chain_ids == chain
+    if lo is not None:
+        mask &= (res_ids >= lo) & (res_ids <= hi)
+    return np.where(mask)[0]
+
+
+def cb_coords_by_token(residues, chain_ids, res_ids):
+    """Cbeta coordinate for every PAE token (CA for glycine), NaN for ligands.
+
+    Aligned to the PAE matrix through token_chain_ids / token_res_ids so the
+    contact mask and the PAE block share indices.
+    """
+    coords = np.full((len(chain_ids), 3), np.nan)
+    for i, (ch, rn) in enumerate(zip(chain_ids, res_ids)):
+        rec = residues.get((str(ch), int(rn)))
+        if rec is None:
+            continue
+        pick = None
+        for name, _el, xyz in rec["atoms"]:
+            if name == "CB":
+                pick = xyz
+                break
+        if pick is None:
+            for name, _el, xyz in rec["atoms"]:
+                if name == "CA":
+                    pick = xyz
+                    break
+        if pick is not None:
+            coords[i] = pick
+    return coords
+
+
+def lis_family(pae, idx_a, idx_b, cb, pae_cutoff=LIS_CUTOFF, cb_cutoff=CB_CUTOFF):
+    """LIS, cLIS, iLIS, LIA, cLIA -- official AFM-LIS definitions.
+
+        t[i,j] = 1 - PAE[i,j]/cutoff  where PAE < cutoff, else 0
+        LIS    = mean(t) over t > 0
+        cLIS   = mean(t) over t > 0 AND Cbeta-Cbeta <= cb_cutoff
+        iLIS   = sqrt(LIS * cLIS)
+    Both block directions are scored separately and averaged; LIA and cLIA sum
+    over both directions.
+    """
+    have_cb = (cb is not None
+               and np.isfinite(cb[idx_a]).all() and np.isfinite(cb[idx_b]).all())
+    lis_dirs, clis_dirs, lia, clia = [], [], 0, 0
+    for a, b in ((idx_a, idx_b), (idx_b, idx_a)):
+        sub = pae[np.ix_(a, b)]
+        t = np.where(sub < pae_cutoff, 1.0 - sub / pae_cutoff, 0.0)
+        tpos = t > 0
+        lia += int(tpos.sum())
+        lis_dirs.append(float(t[tpos].mean()) if tpos.any() else 0.0)
+        if have_cb:
+            d = np.linalg.norm(cb[a][:, None, :] - cb[b][None, :, :], axis=-1)
+            cpos = tpos & (d <= cb_cutoff)
+            clia += int(cpos.sum())
+            clis_dirs.append(float(t[cpos].mean()) if cpos.any() else 0.0)
+
+    lis = float(np.mean(lis_dirs))
+    out = {"LIS": lis, "LIA": lia}
+    if have_cb:
+        clis = float(np.mean(clis_dirs))
+        out.update({"cLIS": clis, "cLIA": clia,
+                    "iLIS": math.sqrt(max(0.0, lis * clis))})
+    else:
+        out.update({"cLIS": None, "cLIA": None, "iLIS": None})
+    return out
+
+
+def _d0(n):
+    """TM-score d0, clamped as in Dunbrack's ipsae.py."""
+    n = max(float(n), 27.0)
+    return max(1.0, 1.24 * (n - 15) ** (1.0 / 3.0) - 1.8)
+
+
+def ipsae_score(pae, idx_a, idx_b, cutoff=IPSAE_CUTOFF):
+    """ipSAE (Dunbrack 2025): max over residues of a pTM-like sum on PAE."""
+    best = 0.0
+    for a, b in ((idx_a, idx_b), (idx_b, idx_a)):
+        sub = pae[np.ix_(a, b)]
+        for row in sub:
+            sel = row[row < cutoff]
+            if sel.size == 0:
+                continue
+            d0 = _d0(sel.size)
+            best = max(best, float((1.0 / (1.0 + (sel / d0) ** 2)).mean()))
+    return best
+
+
+def interface_plddt(residues, chain_a, contacts, chain_b):
+    """Mean pLDDT of the residues that form the interface, and per side."""
+    side_a = sorted({p[0] for p in contacts})
+    side_b = sorted({p[1] for p in contacts})
+    pa = [v for n in side_a for v in residues[(chain_a, n)]["plddt"]]
+    pb = [v for n in side_b for v in residues[(chain_b, n)]["plddt"]]
+    if not pa or not pb:
+        return None, None, None
+    return (round(float(np.mean(pa + pb)), 1),
+            round(float(np.mean(pa)), 1),
+            round(float(np.mean(pb)), 1))
+
+
+def confidence_block(pae, contact_probs, idx_a, idx_b):
+    """Symmetrised PAE minimum and contact-probability statistics."""
+    sym = (pae[np.ix_(idx_a, idx_b)] + pae[np.ix_(idx_b, idx_a)].T) / 2
+    cp = contact_probs[np.ix_(idx_a, idx_b)]
+    return {
+        "min_sym_pae": float(sym.min()),
+        "mean_sym_pae": float(sym.mean()),
+        "max_contact_prob": float(cp.max()),
+        "n_cp_above": int((cp > CP_THRESHOLD).sum()),
+    }
+
+
+# --------------------------------------------------------------------------
+# per-model analysis
+# --------------------------------------------------------------------------
+
+def chain_inventory(residues, chain_ids, effector_chain):
+    """Human-readable summary of what is in the file and what we will use."""
+    lines = []
+    seen = {}
+    for (ch, num), rec in residues.items():
+        d = seen.setdefault(ch, {"n": 0, "het": False})
+        d["n"] += 1
+        d["het"] |= rec["hetatm"]
+    for ch in sorted(seen):
+        used = "USED" if ch in ("A", effector_chain) and not seen[ch]["het"] else "excluded"
+        kind = "ligand (HETATM)" if seen[ch]["het"] else "protein"
+        ntok = int((chain_ids == ch).sum())
+        lines.append(f"      chain {ch}: {kind:16s} {seen[ch]['n']:>4d} residues, "
+                     f"{ntok:>4d} tokens  -> {used}")
+    return "\n".join(lines)
+
+
+def analyse(label, cif_path, json_path, phenotype, effector_chain, verbose=False):
+    residues = load_cif(cif_path)
+    chain_ids, res_ids, pae, contact_probs = load_json(json_path)
+    if verbose:
+        print(chain_inventory(residues, chain_ids, effector_chain), file=sys.stderr)
+
+    cb = cb_coords_by_token(residues, chain_ids, res_ids)
+
+    row = {"Interface": "Autoinhibition", "Model": label, "Phenotype": phenotype}
+
+    # ---- autoinhibition: ARC2-IF x LRR-IF, both within chain A ----
+    arc2 = atom_list(residues, "A", *ARC2_IF)
+    lrr = atom_list(residues, "A", *LRR_IF)
+    contacts = residue_contacts(arc2, lrr)
+    idx_arc2 = token_index(chain_ids, res_ids, "A", *ARC2_IF)
+    idx_lrr = token_index(chain_ids, res_ids, "A", *LRR_IF)
+    conf = confidence_block(pae, contact_probs, idx_arc2, idx_lrr)
+
+    lisf = lis_family(pae, idx_arc2, idx_lrr, cb)
+    ipl, ipl_a, ipl_b = interface_plddt(residues, "A", contacts, "A")
+    row.update({
+        "LIS": round(lisf["LIS"], 3),
+        "cLIS": None if lisf["cLIS"] is None else round(lisf["cLIS"], 3),
+        "iLIS": None if lisf["iLIS"] is None else round(lisf["iLIS"], 3),
+        "LIA": lisf["LIA"],
+        "cLIA": lisf["cLIA"],
+        "ipSAE": round(ipsae_score(pae, idx_arc2, idx_lrr), 3),
+        "Interface pLDDT": ipl,
+        "Interface pLDDT (side 1)": ipl_a,
+        "Interface pLDDT (side 2)": ipl_b,
+        "Max contact probability": round(conf["max_contact_prob"], 2),
+        "AF3 contact pairs > 0.3": conf["n_cp_above"],
+        "BSA (A^2)": round(buried_surface_area(arc2, lrr)),
+        "Geometric contacts < 4.5 A": len(contacts),
+        "Min sym. PAE (A)": round(conf["min_sym_pae"], 2),
+        "Mean sym. PAE (A)": round(conf["mean_sym_pae"], 2),
+        "Rx 397-503 side-chain distance (A)":
+            round(sidechain_min_distance(residues, "A", *POLYMORPHIC), 2),
+    })
+    rows = [row]
+
+    # ---- effector binding: chain A x effector chain ----
+    if effector_chain and any(ch == effector_chain and not r["hetatm"]
+                              for (ch, _), r in residues.items()):
+        rx = atom_list(residues, "A")
+        eff = atom_list(residues, effector_chain)
+        contacts = residue_contacts(rx, eff)
+        idx_rx = token_index(chain_ids, res_ids, "A")
+        idx_eff = token_index(chain_ids, res_ids, effector_chain)
+        conf = confidence_block(pae, contact_probs, idx_rx, idx_eff)
+        lisf = lis_family(pae, idx_rx, idx_eff, cb)
+        ipl, ipl_a, ipl_b = interface_plddt(residues, "A", contacts, effector_chain)
+        rows.append({
+            "Interface": "Effector binding",
+            "Model": label,
+            "Phenotype": phenotype,
+            "LIS": round(lisf["LIS"], 3),
+            "cLIS": None if lisf["cLIS"] is None else round(lisf["cLIS"], 3),
+            "iLIS": None if lisf["iLIS"] is None else round(lisf["iLIS"], 3),
+            "LIA": lisf["LIA"],
+            "cLIA": lisf["cLIA"],
+            "ipSAE": round(ipsae_score(pae, idx_rx, idx_eff), 3),
+            "Interface pLDDT": ipl,
+            "Interface pLDDT (side 1)": ipl_a,
+            "Interface pLDDT (side 2)": ipl_b,
+            "Max contact probability": round(conf["max_contact_prob"], 2),
+            "AF3 contact pairs > 0.3": conf["n_cp_above"],
+            "BSA (A^2)": round(buried_surface_area(rx, eff)),
+            "Geometric contacts < 4.5 A": len(contacts),
+            "Min sym. PAE (A)": round(conf["min_sym_pae"], 2),
+            "Mean sym. PAE (A)": round(conf["mean_sym_pae"], 2),
+            "Rx 397-503 side-chain distance (A)": "",
+        })
+    return rows
+
+
+COLUMNS = ["Interface", "Model", "Phenotype",
+           "LIS", "cLIS", "iLIS", "LIA", "cLIA", "ipSAE",
+           "Max contact probability", "AF3 contact pairs > 0.3", "BSA (A^2)",
+           "Geometric contacts < 4.5 A", "Interface pLDDT",
+           "Interface pLDDT (side 1)", "Interface pLDDT (side 2)",
+           "Min sym. PAE (A)", "Mean sym. PAE (A)",
+           "Rx 397-503 side-chain distance (A)"]
+
+
+def write_outputs(rows, stem="Rx_benchmarking_table"):
+    with open(stem + ".csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+
+    widths = {c: max(len(c), *(len(str(r[c])) for r in rows)) for c in COLUMNS}
+    lines = ["| " + " | ".join(c.ljust(widths[c]) for c in COLUMNS) + " |",
+             "|" + "|".join("-" * (widths[c] + 2) for c in COLUMNS) + "|"]
+    for r in rows:
+        lines.append("| " + " | ".join(str(r[c]).ljust(widths[c])
+                                       for c in COLUMNS) + " |")
+    with open(stem + ".md", "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\nwrote {stem}.csv and {stem}.md")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default=DATA_DIR,
+                    help="directory holding the AF3 .cif and full_data.json files")
+    ap.add_argument("--out", default="Rx_benchmarking_table")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print the chain inventory used for each model")
+    args = ap.parse_args()
+
+    rows = []
+    for label, cif, js, phenotype, eff in MODELS:
+        cif_path = os.path.join(args.dir, cif)
+        json_path = os.path.join(args.dir, js)
+        if not (os.path.exists(cif_path) and os.path.exists(json_path)):
+            print(f"skipping {label}: missing {cif} or {js}", file=sys.stderr)
+            continue
+        print(f"analysing {label} ...", file=sys.stderr)
+        rows.extend(analyse(label, cif_path, json_path, phenotype, eff, args.verbose))
+
+    if not rows:
+        sys.exit("no models analysed - check --dir")
+
+    order = {"Autoinhibition": 0, "Effector binding": 1}
+    rows.sort(key=lambda r: (order[r["Interface"]],
+                             [m[0] for m in MODELS].index(r["Model"])))
+    write_outputs(rows, args.out)
+
+
+if __name__ == "__main__":
+    main()
