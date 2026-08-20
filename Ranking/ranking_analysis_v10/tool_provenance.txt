@@ -1,0 +1,44 @@
+=== AUTHOR/NATIVE METRICS ===
+AFM-LIS metrics are obtained by executing the authors' official lis.py; this wrapper does not reimplement iLIS.
+AFM-LIS URL: https://raw.githubusercontent.com/flyark/AFM-LIS/main/lis.py
+AFM-LIS ref: main
+AFM-LIS SHA256: ebedeff9a1fa58b5b8c27ef899c9b20c12f5922f4404a4214cd95e2c00c5e1a5
+IPSAE URL: https://raw.githubusercontent.com/DunbrackLab/IPSAE/main/ipsae.py
+IPSAE ref: main
+IPSAE SHA256: 10cf9b08c68c91e06cb28526cf2026f47a3980c9048fd3226d13e3304eaf1c27
+AFM-LIS parameters passed to official lis.py: PAE cutoff=12.0 A, Cbeta cutoff=8.0 A. Current lis.py implementation applies strict < cutoffs internally.
+ipSAE parameters: PAE cutoff=10.0 A, distance argument=10.0 A
+contact probability thresholds: [0.3, 0.5]
+SASA backend: benchmark
+Interface residue source: geometric (geometric = heavy-atom contacts < 4.5 A, author numbering)
+AB heavy-atom clash count cutoff: <1.5 A
+Clash QC rule: flagged only when the MEDIAN model has >=1 clashing pair (equivalently >=3 of 5 models); AB_CLASH_SEVERE when the mean is >=3 pairs/model, otherwise AB_CLASH_REPEATED. A single model with >=10 pairs is flagged separately. Clash counts never enter the ranking.
+Pairwise analysis: chain1=NLR, chain2=effector; chain3=ATP excluded from local interface metrics.
+
+=== DERIVED / PROJECT-SPECIFIC ANALYSES (NOT OFFICIAL AF3/AFM-LIS/IPSAE METRICS) ===
+contact_prob_max/mean and counts above 0.3/0.5: summaries derived from AF3's native contact_probs matrix.
+intra-/inter-chain PAE mean/median/p90: summaries derived from AF3's native PAE matrix.
+heavy-atom clash-pair count (<1.5 A): project-specific geometry QC; AF3 has_clash is the native AF3 clash flag.
+geometric interface residues/contact pairs (<4.5 A): project-specific structural definition.
+BSA: project-specific Shrake-Rupley implementation chosen for consistency with the Rx benchmark.
+vLRR_fraction, Yes/Partially/No binning, Jaccard interface consistency and final ranking: project-specific analyses.
+
+BSA convention:
+  BSA_total_A2          = SASA(NLR) + SASA(effector) - SASA(NLR+effector)  [total buried]
+  BSA_interface_area_A2 = BSA_total_A2 / 2                                  [per-side]
+  Rx_benchmarking_table.py reports the PER-SIDE number, i.e. BSA_interface_area_A2.
+  Quote that column, not BSA_total_A2, or the two tables are not comparable.
+
+Ranking key (all medians across models):
+  1. vLRR localisation (computed fraction binned, else manual class)
+  2. iLIS median                 [PAE channel]
+  3. n_contact_pairs_gt0.3       [distogram channel, independent of PAE]
+  4. ipSAE median                [PAE channel, confirmatory]
+  5. interface model-support fraction (non-empty interface models / all models)
+  6. interface consistency (Jaccard among interface-bearing models)
+vLRR bins: >= 0.6 -> Yes; >= 0.2 -> Partially; else No
+Interpretation note: rank_within_effector is the primary cross-candidate comparison. suggested_rank_within_backbone mixes different effectors and is exploratory because raw contact-pair counts and confidence calibration can be effector-dependent.
+
+cLIR index ranges observed (check against real chain lengths before trusting vLRR_fraction):
+  Rx: cLIR indices span 400..802  (NLR chain has 1008 tokens)
+  Sr35: cLIR indices span 59..872  (NLR chain has 1027 tokens)
